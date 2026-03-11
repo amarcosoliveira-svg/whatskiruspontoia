@@ -123,3 +123,16 @@ app.listen(PORT, () => {
   console.log(`🚀 Porta ${PORT}`);
   connectWhatsApp(true);
 });
+const QRCode = require('qrcode');
+
+app.get('/qr', async (req, res) => {
+  if (qrCode) {
+    const qrImage = await QRCode.toDataURL(qrCode);
+    res.send(`<html><body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#111"><img src="${qrImage}" style="width:400px;height:400px"/></body></html>`);
+  } else if (isConnected) {
+    res.send('<html><body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#111;color:#0f0"><h1>✅ Conectado!</h1></body></html>');
+  } else {
+    res.send('<html><body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#111;color:#fff"><h1>Aguardando QR code...</h1></body></html>');
+  }
+});
+

@@ -1,5 +1,5 @@
 const express = require("express");
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
@@ -11,9 +11,9 @@ let sock = null;
 let isConnected = false;
 let qrCode = null;
 let retryCount = 0;
-const MAX_RETRIES = 3;
-
+const MAX_RETRIES = 5;
 const AUTH_FOLDER = path.join(__dirname, "auth_info");
+const logger = pino({ level: "silent" });
 
 function clearAuthFolder() {
   if (fs.existsSync(AUTH_FOLDER)) {
@@ -25,101 +25,101 @@ function clearAuthFolder() {
 async function connectWhatsApp(forceNew = false) {
   if (forceNew) clearAuthFolder();
 
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info");
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    console.log(`📱 Usando WA versão: ${version.join(".")}`);
 
-  sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: true,
-    browser: ["ClockIn Bot", "Chrome", "1.0.0"],
-  });
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
 
-  sock.ev.on("creds.update", saveCreds);
+    sock = makeWASocket({
+      version,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      logger,
+      browser: ["Ubuntu", "Chrome", "22.0.0"],
+      generateHighQualityLinkPreview: false,
+      syncFullHistory: false,
+    });
 
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      qrCode = qr;
-      retryCount = 0;
-      console.log("📱 QR Code gerado. Acesse GET /qr");
-    }
+    sock.ev.on("creds.update", saveCreds);
 
-    if (connection === "open") {
-      isConnected = true;
-      qrCode = null;
-      retryCount = 0;
-      console.log("✅ WhatsApp conectado!");
-    }
-
-    if (connection === "close") {
-      isConnected = false;
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      console.log(`❌ Desconectado. Código: ${statusCode}. Tentativa: ${retryCount + 1}/${MAX_RETRIES}`);
-
-      if (statusCode === DisconnectReason.loggedOut) {
-        console.log("🚪 Deslogado. Limpando sessão...");
-        clearAuthFolder();
+    sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
+      if (qr) {
+        qrCode = qr;
         retryCount = 0;
-        setTimeout(() => connectWhatsApp(true), 5000);
-        return;
+        console.log("📲 QR Code gerado! Acesse GET /qr");
       }
 
-      if (statusCode === 405) {
-        retryCount++;
-        if (retryCount >= MAX_RETRIES) {
-          console.log("🛑 Máximo de tentativas atingido. Use POST /reset para tentar novamente.");
+      if (connection === "open") {
+        isConnected = true;
+        qrCode = null;
+        retryCount = 0;
+        console.log("✅ WhatsApp conectado!");
+      }
+
+      if (connection === "close") {
+        isConnected = false;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        console.log(`❌ Desconectado. Código: ${statusCode}`);
+
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+          console.log("🔒 Sessão encerrada. Use POST /reset para reconectar.");
+          clearAuthFolder();
           return;
         }
-        console.log(`⚠️ Erro 405. Aguardando ${retryCount * 10}s antes de reconectar...`);
-        clearAuthFolder();
-        setTimeout(() => connectWhatsApp(true), retryCount * 10000);
-        return;
-      }
 
-      retryCount++;
-      if (retryCount < MAX_RETRIES) {
-        setTimeout(() => connectWhatsApp(false), 5000);
+        retryCount++;
+        if (retryCount <= MAX_RETRIES) {
+          const delay = Math.min(retryCount * 5000, 30000);
+          console.log(`🔄 Tentativa ${retryCount}/${MAX_RETRIES} em ${delay / 1000}s...`);
+          setTimeout(() => connectWhatsApp(statusCode === 405), delay);
+        } else {
+          console.log("⛔ Máximo de tentativas. Use POST /reset.");
+        }
       }
+    });
+  } catch (err) {
+    console.error("💥 Erro ao iniciar:", err.message);
+    retryCount++;
+    if (retryCount <= MAX_RETRIES) {
+      setTimeout(() => connectWhatsApp(true), 10000);
     }
-  });
+  }
 }
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", connected: isConnected, retries: retryCount });
-});
+app.get("/health", (req, res) => res.json({ status: "ok", connected: isConnected }));
 
 app.get("/qr", (req, res) => {
-  if (isConnected) return res.json({ status: "already_connected" });
-  if (!qrCode) return res.json({ status: "no_qr", message: "Aguardando QR code...", retries: retryCount });
+  if (isConnected) return res.json({ status: "connected" });
+  if (!qrCode) return res.json({ status: "waiting", message: "Aguardando QR..." });
   res.json({ status: "pending", qr: qrCode });
 });
 
 app.post("/reset", (req, res) => {
-  console.log("🔄 Reset manual solicitado.");
   clearAuthFolder();
   isConnected = false;
   qrCode = null;
   retryCount = 0;
   connectWhatsApp(true);
-  res.json({ success: true, message: "Sessão resetada. Aguarde novo QR code em /qr" });
+  res.json({ success: true, message: "Resetado. Aguarde QR." });
 });
 
 app.post("/send-whatsapp", async (req, res) => {
+  const { phone, message } = req.body;
+  if (!phone || !message) return res.status(400).json({ error: "phone e message obrigatórios" });
+  if (!isConnected || !sock) return res.status(503).json({ error: "WhatsApp desconectado" });
   try {
-    const { phone, message } = req.body;
-    if (!phone || !message) return res.status(400).json({ success: false, error: "phone e message obrigatórios" });
-    if (!isConnected || !sock) return res.status(503).json({ success: false, error: "WhatsApp não conectado" });
-    const jid = `${phone}@s.whatsapp.net`;
-    await sock.sendMessage(jid, { text: message });
-    console.log(`✅ Mensagem enviada para ${phone}`);
+    await sock.sendMessage(`${phone}@s.whatsapp.net`, { text: message });
     res.json({ success: true });
-  } catch (error) {
-    console.error("Erro ao enviar:", error.message);
-    res.status(500).json({ success: false, error: error.message });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
+  console.log(`🚀 Porta ${PORT}`);
   connectWhatsApp(true);
 });

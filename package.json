@@ -1,15 +1,14 @@
 {
   "name": "whatsskirus",
   "version": "1.0.0",
-  "description": "WhatsApp Bot Server",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.16",
-    "express": "^4.18.2",
-    "pino": "^8.16.2",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "express": "^4.22.1",
+    "pino": "^8.21.0",
     "qrcode": "^1.5.4"
   }
 }

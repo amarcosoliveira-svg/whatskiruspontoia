@@ -92,14 +92,27 @@ async function connectWhatsApp() {
 
 app.get("/qr", async (req, res) => {
   if (isConnected) {
-    return res.send("<html><body style='display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;'><h1>✅ WhatsApp já está conectado!</h1></body></html>");
+    return res.send(
+      "<html><body style='display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;'>" +
+      "<h1>✅ WhatsApp já está conectado!</h1></body></html>"
+    );
   }
   if (!qrCode) {
-    return res.send("<html><head><meta http-equiv='refresh' content='5'></head><body style='display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;'><h1>⏳ Aguardando QR Code... (atualiza em 5s)</h1></body></html>");
+    return res.send(
+      "<html><head><meta http-equiv='refresh' content='5'></head>" +
+      "<body style='display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;'>" +
+      "<h1>⏳ Aguardando QR Code... (atualiza em 5s)</h1></body></html>"
+    );
   }
   try {
     const qrImage = await QRCode.toDataURL(qrCode);
-    res.send(`<html><head><meta http-equiv='refresh' content='30'></head><body style='display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;'><h2>Escaneie o QR Code com WhatsApp</h2><img src='${qrImage}' style='width:300px;height:300px;'/><p style='color:gray;'>Atualiza automaticamente em 30s</p></body></html>`);
+    res.send(
+      "<html><head><meta http-equiv='refresh' content='30'></head>" +
+      "<body style='display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;'>" +
+      "<h2>Escaneie o QR Code com WhatsApp</h2>" +
+      `<img src='${qrImage}' style='width:300px;height:300px;'/>` +
+      "<p style='color:gray;'>Atualiza automaticamente em 30s</p></body></html>"
+    );
   } catch (err) {
     res.status(500).send("Erro ao gerar QR Code");
   }
@@ -141,10 +154,46 @@ app.post("/send-whatsapp", async (req, res) => {
 
   try {
     const formattedPhone = phone.replace(/\D/g, "");
-    const jid = `${formattedPhone}@s.whatsapp.net`;
-    await sock.sendMessage(jid, { text: message });
-    console.log(`Message sent to ${formattedPhone}`);
-    res.json({ success: true, message: "Message sent" });
+    console.log(`Looking up number: ${formattedPhone}`);
+
+    // Use onWhatsApp to resolve the correct JID
+    const [result] = await sock.onWhatsApp(formattedPhone);
+
+    if (!result || !result.exists) {
+      // Try alternate format: with/without the 9th digit
+      const areaCode = formattedPhone.slice(2, 4);
+      const rest = formattedPhone.slice(4);
+      let altPhone;
+
+      if (rest.length === 9 && rest.startsWith("9")) {
+        // Remove 9th digit
+        altPhone = formattedPhone.slice(0, 4) + rest.slice(1);
+      } else if (rest.length === 8) {
+        // Add 9th digit
+        altPhone = formattedPhone.slice(0, 4) + "9" + rest;
+      }
+
+      if (altPhone) {
+        console.log(`Number not found, trying alternate: ${altPhone}`);
+        const [altResult] = await sock.onWhatsApp(altPhone);
+
+        if (altResult && altResult.exists) {
+          await sock.sendMessage(altResult.jid, { text: message });
+          console.log(`✅ Message sent to ${altResult.jid} (alternate format)`);
+          return res.json({ success: true, jid: altResult.jid, format: "alternate" });
+        }
+      }
+
+      console.log(`❌ Number ${formattedPhone} not found on WhatsApp`);
+      return res.status(404).json({
+        error: "Number not registered on WhatsApp",
+        phone: formattedPhone,
+      });
+    }
+
+    await sock.sendMessage(result.jid, { text: message });
+    console.log(`✅ Message sent to ${result.jid}`);
+    res.json({ success: true, jid: result.jid, format: "original" });
   } catch (err) {
     console.error("Error sending message:", err.message);
     res.status(500).json({ error: "Failed to send message", details: err.message });

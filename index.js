@@ -395,3 +395,16 @@ app.listen(PORT, () => {
   console.log(`[Server] Webhook URL: ${SUPABASE_WEBHOOK_URL || "NOT SET"}`);
   connectToWhatsApp();
 });
+app.post("/send", async (req, res) => {
+  const { to, message } = req.body;
+  if (!to || !message) return res.status(400).json({ error: "to e message são obrigatórios" });
+  
+  try {
+    const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
+    await sock.sendMessage(jid, { text: message });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Erro ao enviar:", err);
+    res.status(500).json({ error: err.message });
+  }
+});

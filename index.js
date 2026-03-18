@@ -55,6 +55,14 @@ async function sendWebhookStatus(phone, status, messageId) {
   }
 }
 
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  };
+}
+
 // ─── WhatsApp Connection ──────────────────────────────────
 
 async function connectToWhatsApp() {
@@ -166,9 +174,8 @@ async function connectToWhatsApp() {
       }
     }
   });
-}
 
-// ── Incoming messages ──
+  // ── Incoming messages (forward to webhook) ──
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
@@ -184,7 +191,7 @@ async function connectToWhatsApp() {
 
       if (!text || !from) continue;
 
-      console.log(`[Incoming] Message from ${from}: ${text}`);
+      console.log(`[Incoming] From ${from}: ${text}`);
 
       if (SUPABASE_WEBHOOK_URL) {
         try {
@@ -194,13 +201,16 @@ async function connectToWhatsApp() {
             body: JSON.stringify({ from, message: text }),
           });
           const data = await resp.json();
-          console.log(`[Webhook] Response:`, data);
+          console.log(`[Webhook] Forwarded message from ${from}:`, data);
         } catch (err) {
-          console.error("[Webhook] Error:", err.message);
+          console.error("[Webhook] Error forwarding message:", err.message);
         }
+      } else {
+        console.log("[Webhook] URL not configured. Message not forwarded.");
       }
     }
   });
+}
 
 function clearSession() {
   try {
@@ -235,7 +245,7 @@ app.get("/qr-json", (req, res) => {
   });
 });
 
-// CORS preflight for /qr-json and /health-json
+// CORS preflight
 app.options("/qr-json", (req, res) => {
   res.set(corsHeaders());
   res.sendStatus(204);
@@ -255,23 +265,15 @@ app.get("/health-json", (req, res) => {
   });
 });
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "content-type",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  };
-}
-
 // QR code page (HTML)
 app.get("/qr", (req, res) => {
   if (connectionStatus === "connected") {
     return res.send(`
-      <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#0a0a0a;color:#22c55e;">
+      <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif">
         <div style="text-align:center">
-          <h1>✅ WhatsApp Conectado</h1>
+          <h2>✅ WhatsApp Conectado</h2>
           <p>A sessão está ativa.</p>
-          <a href="/health" style="color:#60a5fa">Ver status</a>
+          <a href="/health">Ver status</a>
         </div>
       </body></html>
     `);
@@ -279,9 +281,9 @@ app.get("/qr", (req, res) => {
 
   if (!qrCode) {
     return res.send(`
-      <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#0a0a0a;color:#f59e0b;">
+      <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif">
         <div style="text-align:center">
-          <h1>⏳ Aguardando QR Code...</h1>
+          <h2>⏳ Aguardando QR Code...</h2>
           <p>O QR code será gerado em instantes.</p>
           <script>setTimeout(() => location.reload(), 3000)</script>
         </div>
@@ -290,12 +292,12 @@ app.get("/qr", (req, res) => {
   }
 
   res.send(`
-    <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#0a0a0a;color:white;">
+    <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif">
       <div style="text-align:center">
-        <h1>📱 Escaneie o QR Code</h1>
+        <h2>📱 Escaneie o QR Code</h2>
         <p>Abra o WhatsApp > Dispositivos Vinculados > Vincular Dispositivo</p>
-        <img src="${qrCode}" style="width:300px;height:300px;margin:20px auto;border-radius:12px;" />
-        <script>setTimeout(() => location.reload(), 20000)</script>
+        <img src="${qrCode}" style="width:300px;height:300px" />
+        <script>setTimeout(() => location.reload(), 15000)</script>
       </div>
     </body></html>
   `);

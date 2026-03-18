@@ -168,6 +168,40 @@ async function connectToWhatsApp() {
   });
 }
 
+// ── Incoming messages ──
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+
+    for (const msg of messages) {
+      if (msg.key.fromMe) continue;
+      if (msg.key.remoteJid === "status@broadcast") continue;
+
+      const from = getPhoneFromJid(msg.key.remoteJid);
+      const text =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        "";
+
+      if (!text || !from) continue;
+
+      console.log(`[Incoming] Message from ${from}: ${text}`);
+
+      if (SUPABASE_WEBHOOK_URL) {
+        try {
+          const resp = await fetch(SUPABASE_WEBHOOK_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ from, message: text }),
+          });
+          const data = await resp.json();
+          console.log(`[Webhook] Response:`, data);
+        } catch (err) {
+          console.error("[Webhook] Error:", err.message);
+        }
+      }
+    }
+  });
+
 function clearSession() {
   try {
     if (fs.existsSync(AUTH_DIR)) {

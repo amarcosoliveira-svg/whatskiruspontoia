@@ -7,7 +7,6 @@ const {
   makeCacheableSignalKeyStore,
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
-const { Boom } = require("@hapi/boom");
 const fs = require("fs");
 const path = require("path");
 const QRCode = require("qrcode");
@@ -16,8 +15,8 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const AUTH_DIR = process.env.AUTH_DIR || "./auth_info";
-const SUPABASE_WEBHOOK_URL = process.env.SUPABASE_WEBHOOK_URL;
+const AUTH_DIR = path.resolve(process.env.AUTH_DIR || "./auth_info");
+const SUPABASE_WEBHOOK_URL = process.env.SUPABASE_WEBHOOK_URL || "";
 
 const logger = pino({ level: "silent" });
 
@@ -26,181 +25,25 @@ let qrCode = null;
 let connectionStatus = "disconnected";
 let lastError = null;
 let reconnectAttempts = 0;
+let reconnectTimer = null;
+let isConnecting = false;
+
 const MAX_RECONNECT_ATTEMPTS = 5;
 
 // ─── Helpers ──────────────────────────────────────────────
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  };
+}
 
 function getPhoneFromJid(jid) {
   if (!jid) return null;
   return jid.replace(/@s\.whatsapp\.net|@g\.us/g, "");
 }
-
-async function sendWebhookStatus(phone, status, messageId) {
-  if (!SUPABASE_WEBHOOK_URL) {
-    console.log("[Webhook] URL not configured, skipping status update");
-    return;
-  }
-
-  try {
-    const response = await fetch(SUPABASE_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ phone, status, messageId }),
-    });
-
-    const result = await response.json();
-    console.log(`[Webhook] Status ${status} for ${phone}:`, result);
-  } catch (err) {
-    console.error("[Webhook] Error sending status:", err.message);
-  }
-}
-
-// ─── WhatsApp Connection ──────────────────────────────────
-
-async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
-
-  console.log(`[WhatsApp] Using Baileys version: ${version.join(".")}`);
-
-  sock = makeWASocket({
-    version,
-    logger,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    printQRInTerminal: false,
-    generateHighQualityLinkPreview: false,
-    markOnlineOnConnect: false,
-  });
-
-  // ── Connection events ──
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      qrCode = await QRCode.toDataURL(qr);
-      connectionStatus = "waiting_qr";
-      console.log("[WhatsApp] QR code generated - scan at /qr");
-    }
-
-    if (connection === "close") {
-      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      lastError = lastDisconnect?.error?.message || "Unknown error";
-      connectionStatus = "disconnected";
-      qrCode = null;
-
-      console.log(`[WhatsApp] Disconnected. Reason: ${reason} - ${lastError}`);
-
-      if (reason === DisconnectReason.loggedOut) {
-        console.log("[WhatsApp] Logged out. Clearing session...");
-        clearSession();
-        reconnectAttempts = 0;
-      } else if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-        reconnectAttempts++;
-        const delay = Math.min(5000 * reconnectAttempts, 30000);
-        console.log(
-          `[WhatsApp] Reconnecting in ${delay / 1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`
-        );
-        setTimeout(connectToWhatsApp, delay);
-      } else {
-        console.log("[WhatsApp] Max reconnect attempts reached. Use /reset to clear and try again.");
-      }
-    }
-
-    if (connection === "open") {
-      connectionStatus = "connected";
-      qrCode = null;
-      reconnectAttempts = 0;
-      lastError = null;
-      console.log("[WhatsApp] Connected successfully!");
-    }
-  });
-
-  // ── Save credentials on update ──
-  sock.ev.on("creds.update", saveCreds);
-
-  // ── Message status updates (DELIVERED, READ) ──
-  sock.ev.on("messages.update", async (updates) => {
-    for (const update of updates) {
-      const { key, update: msgUpdate } = update;
-
-      if (!msgUpdate || msgUpdate.status === undefined) continue;
-
-      const phone = getPhoneFromJid(key.remoteJid);
-      const messageId = key.id;
-
-      let status;
-      switch (msgUpdate.status) {
-        case 2:
-          status = "DELIVERED";
-          break;
-        case 3:
-          status = "READ";
-          break;
-        case 4:
-          status = "READ";
-          break;
-        default:
-          continue;
-      }
-
-      console.log(`[Status] Message ${messageId} to ${phone}: ${status}`);
-      await sendWebhookStatus(phone, status, messageId);
-    }
-  });
-
-  // ── Message receipt (delivered/read confirmations) ──
-  sock.ev.on("message-receipt.update", async (updates) => {
-    for (const update of updates) {
-      const phone = getPhoneFromJid(update.key.remoteJid);
-      const messageId = update.key.id;
-
-      if (update.receipt?.readTimestamp) {
-        console.log(`[Receipt] Message ${messageId} read by ${phone}`);
-        await sendWebhookStatus(phone, "READ", messageId);
-      } else if (update.receipt?.receiptTimestamp) {
-        console.log(`[Receipt] Message ${messageId} delivered to ${phone}`);
-        await sendWebhookStatus(phone, "DELIVERED", messageId);
-      }
-    }
-  });
-}
-
-// ── Incoming messages ──
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
-
-    for (const msg of messages) {
-      if (msg.key.fromMe) continue;
-      if (msg.key.remoteJid === "status@broadcast") continue;
-
-      const from = getPhoneFromJid(msg.key.remoteJid);
-      const text =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        "";
-
-      if (!text || !from) continue;
-
-      console.log(`[Incoming] Message from ${from}: ${text}`);
-
-      if (SUPABASE_WEBHOOK_URL) {
-        try {
-          const resp = await fetch(SUPABASE_WEBHOOK_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ from, message: text }),
-          });
-          const data = await resp.json();
-          console.log(`[Webhook] Response:`, data);
-        } catch (err) {
-          console.error("[Webhook] Error:", err.message);
-        }
-      }
-    }
-  });
 
 function clearSession() {
   try {
@@ -213,10 +56,233 @@ function clearSession() {
   }
 }
 
+function scheduleReconnect() {
+  if (reconnectTimer || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      console.log("[WhatsApp] Max reconnect attempts reached. Use /reset to clear and try again.");
+    }
+    return;
+  }
+
+  reconnectAttempts += 1;
+  const delay = Math.min(5000 * reconnectAttempts, 30000);
+
+  console.log(
+    `[WhatsApp] Reconnecting in ${delay / 1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`
+  );
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToWhatsApp();
+  }, delay);
+}
+
+async function sendWebhookPayload(payload) {
+  if (!SUPABASE_WEBHOOK_URL) {
+    console.log("[Webhook] SUPABASE_WEBHOOK_URL not configured, skipping");
+    return;
+  }
+
+  try {
+    const response = await fetch(SUPABASE_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const text = await response.text();
+    console.log("[Webhook] Response:", text);
+  } catch (err) {
+    console.error("[Webhook] Error:", err.message);
+  }
+}
+
+async function sendWebhookStatus(phone, status, messageId) {
+  await sendWebhookPayload({ phone, status, messageId });
+}
+
+function extractMessageText(message) {
+  if (!message) return "";
+
+  if (message.conversation) return message.conversation;
+  if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
+  if (message.imageMessage?.caption) return message.imageMessage.caption;
+  if (message.videoMessage?.caption) return message.videoMessage.caption;
+
+  if (message.ephemeralMessage?.message) {
+    return extractMessageText(message.ephemeralMessage.message);
+  }
+
+  if (message.viewOnceMessage?.message) {
+    return extractMessageText(message.viewOnceMessage.message);
+  }
+
+  if (message.documentWithCaptionMessage?.message) {
+    return extractMessageText(message.documentWithCaptionMessage.message);
+  }
+
+  return "";
+}
+
+// ─── WhatsApp Connection ──────────────────────────────────
+
+async function connectToWhatsApp() {
+  if (isConnecting) return;
+  isConnecting = true;
+
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { version } = await fetchLatestBaileysVersion();
+
+    console.log(`[WhatsApp] Using Baileys version: ${version.join(".")}`);
+
+    sock = makeWASocket({
+      version,
+      logger,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      printQRInTerminal: false,
+      generateHighQualityLinkPreview: false,
+      markOnlineOnConnect: false,
+    });
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        qrCode = await QRCode.toDataURL(qr);
+        connectionStatus = "waiting_qr";
+        console.log("[WhatsApp] QR code generated - scan at /qr");
+      }
+
+      if (connection === "open") {
+        connectionStatus = "connected";
+        qrCode = null;
+        reconnectAttempts = 0;
+        lastError = null;
+
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+
+        console.log("[WhatsApp] Connected successfully!");
+      }
+
+      if (connection === "close") {
+        const statusCode =
+          lastDisconnect?.error?.output?.statusCode ||
+          lastDisconnect?.error?.data?.statusCode ||
+          lastDisconnect?.error?.statusCode ||
+          null;
+
+        lastError = lastDisconnect?.error?.message || "Unknown error";
+        connectionStatus = "disconnected";
+        qrCode = null;
+        sock = null;
+
+        console.log(`[WhatsApp] Disconnected. Reason: ${statusCode} - ${lastError}`);
+
+        if (statusCode === DisconnectReason.loggedOut) {
+          console.log("[WhatsApp] Logged out. Clearing session...");
+          clearSession();
+          reconnectAttempts = 0;
+          scheduleReconnect();
+        } else {
+          scheduleReconnect();
+        }
+      }
+    });
+
+    // Status updates (delivered/read)
+    sock.ev.on("messages.update", async (updates) => {
+      for (const item of updates) {
+        const { key, update } = item;
+        if (!update || update.status === undefined) continue;
+
+        const phone = getPhoneFromJid(key.remoteJid);
+        const messageId = key.id;
+
+        let status = null;
+        switch (update.status) {
+          case 2:
+            status = "DELIVERED";
+            break;
+          case 3:
+          case 4:
+            status = "READ";
+            break;
+          default:
+            break;
+        }
+
+        if (status && phone && messageId) {
+          console.log(`[Status] Message ${messageId} to ${phone}: ${status}`);
+          await sendWebhookStatus(phone, status, messageId);
+        }
+      }
+    });
+
+    // Receipt updates
+    sock.ev.on("message-receipt.update", async (updates) => {
+      for (const update of updates) {
+        const phone = getPhoneFromJid(update.key?.remoteJid);
+        const messageId = update.key?.id;
+
+        if (!phone || !messageId) continue;
+
+        if (update.receipt?.readTimestamp) {
+          console.log(`[Receipt] Message ${messageId} read by ${phone}`);
+          await sendWebhookStatus(phone, "READ", messageId);
+        } else if (update.receipt?.receiptTimestamp) {
+          console.log(`[Receipt] Message ${messageId} delivered to ${phone}`);
+          await sendWebhookStatus(phone, "DELIVERED", messageId);
+        }
+      }
+    });
+
+    // Incoming messages
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
+
+      for (const msg of messages) {
+        if (!msg?.key) continue;
+        if (msg.key.fromMe) continue;
+        if (msg.key.remoteJid === "status@broadcast") continue;
+
+        const from = getPhoneFromJid(msg.key.remoteJid);
+        const text = extractMessageText(msg.message);
+        const messageId = msg.key.id || null;
+
+        if (!from || !text) continue;
+
+        console.log(`[Incoming] Message from ${from}: ${text}`);
+
+        await sendWebhookPayload({
+          from,
+          message: text,
+          messageId,
+        });
+      }
+    });
+  } catch (err) {
+    lastError = err.message;
+    connectionStatus = "disconnected";
+    sock = null;
+    console.error("[WhatsApp] Connection error:", err.message);
+    scheduleReconnect();
+  } finally {
+    isConnecting = false;
+  }
+}
+
 // ─── API Routes ───────────────────────────────────────────
 
-// Health check (JSON)
-app.get("/health", (req, res) => {
+app.get("/", (req, res) => {
   res.json({
     status: connectionStatus,
     uptime: process.uptime(),
@@ -226,19 +292,14 @@ app.get("/health", (req, res) => {
   });
 });
 
-// QR code as JSON (for frontend embedding)
-app.get("/qr-json", (req, res) => {
-  res.set(corsHeaders());
+app.get("/health", (req, res) => {
   res.json({
     status: connectionStatus,
-    qrCode: qrCode || null,
+    uptime: process.uptime(),
+    lastError,
+    reconnectAttempts,
+    webhookConfigured: !!SUPABASE_WEBHOOK_URL,
   });
-});
-
-// CORS preflight for /qr-json and /health-json
-app.options("/qr-json", (req, res) => {
-  res.set(corsHeaders());
-  res.sendStatus(204);
 });
 
 app.options("/health-json", (req, res) => {
@@ -252,56 +313,82 @@ app.get("/health-json", (req, res) => {
     status: connectionStatus,
     lastError,
     reconnectAttempts,
+    webhookConfigured: !!SUPABASE_WEBHOOK_URL,
   });
 });
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "content-type",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  };
-}
+app.options("/qr-json", (req, res) => {
+  res.set(corsHeaders());
+  res.sendStatus(204);
+});
 
-// QR code page (HTML)
+app.get("/qr-json", (req, res) => {
+  res.set(corsHeaders());
+  res.json({
+    status: connectionStatus,
+    qrCode: qrCode || null,
+  });
+});
+
 app.get("/qr", (req, res) => {
   if (connectionStatus === "connected") {
     return res.send(`
-      <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#0a0a0a;color:#22c55e;">
-        <div style="text-align:center">
+      <!DOCTYPE html>
+      <html lang="pt-BR">
+        <head>
+          <meta charset="UTF-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <title>WhatsApp conectado</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; padding: 24px; text-align: center;">
           <h1>✅ WhatsApp Conectado</h1>
           <p>A sessão está ativa.</p>
-          <a href="/health" style="color:#60a5fa">Ver status</a>
-        </div>
-      </body></html>
+          <a href="/health" target="_blank">Ver status</a>
+        </body>
+      </html>
     `);
   }
 
   if (!qrCode) {
     return res.send(`
-      <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#0a0a0a;color:#f59e0b;">
-        <div style="text-align:center">
+      <!DOCTYPE html>
+      <html lang="pt-BR">
+        <head>
+          <meta charset="UTF-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <title>Aguardando QR Code</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; padding: 24px; text-align: center;">
           <h1>⏳ Aguardando QR Code...</h1>
           <p>O QR code será gerado em instantes.</p>
-          <script>setTimeout(() => location.reload(), 3000)</script>
-        </div>
-      </body></html>
+          <a href="/qr">Atualizar</a>
+        </body>
+      </html>
     `);
   }
 
   res.send(`
-    <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#0a0a0a;color:white;">
-      <div style="text-align:center">
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Escaneie o QR Code</title>
+      </head>
+      <body style="font-family: Arial, sans-serif; padding: 24px; text-align: center;">
         <h1>📱 Escaneie o QR Code</h1>
-        <p>Abra o WhatsApp > Dispositivos Vinculados > Vincular Dispositivo</p>
-        <img src="${qrCode}" style="width:300px;height:300px;margin:20px auto;border-radius:12px;" />
-        <script>setTimeout(() => location.reload(), 20000)</script>
-      </div>
-    </body></html>
+        <p>Abra o WhatsApp → Dispositivos vinculados → Vincular dispositivo</p>
+        <img src="${qrCode}" alt="QR Code do WhatsApp" style="max-width: 320px; width: 100%;" />
+      </body>
+    </html>
   `);
 });
 
-// Reset session
+app.options("/reset-json", (req, res) => {
+  res.set(corsHeaders());
+  res.sendStatus(204);
+});
+
 app.get("/reset", async (req, res) => {
   console.log("[Reset] Clearing session and reconnecting...");
 
@@ -321,15 +408,14 @@ app.get("/reset", async (req, res) => {
   reconnectAttempts = 0;
   lastError = null;
 
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
   setTimeout(() => connectToWhatsApp(), 2000);
 
   res.json({ success: true, message: "Session cleared. Access /qr to scan." });
-});
-
-// Reset with CORS
-app.options("/reset-json", (req, res) => {
-  res.set(corsHeaders());
-  res.sendStatus(204);
 });
 
 app.get("/reset-json", async (req, res) => {
@@ -352,17 +438,24 @@ app.get("/reset-json", async (req, res) => {
   reconnectAttempts = 0;
   lastError = null;
 
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
   setTimeout(() => connectToWhatsApp(), 2000);
 
   res.json({ success: true, message: "Session cleared. QR will regenerate." });
 });
 
-// Send WhatsApp message
 app.post("/send-whatsapp", async (req, res) => {
   const { phone, message } = req.body;
 
   if (!phone || !message) {
-    return res.status(400).json({ success: false, error: "phone and message are required" });
+    return res.status(400).json({
+      success: false,
+      error: "phone and message are required",
+    });
   }
 
   if (connectionStatus !== "connected" || !sock) {
@@ -373,11 +466,12 @@ app.post("/send-whatsapp", async (req, res) => {
   }
 
   try {
-    const jidCandidates = [phone];
+    const cleanPhone = String(phone).replace(/\D/g, "");
+    const jidCandidates = [cleanPhone];
 
-    if (phone.startsWith("55") && phone.length >= 12) {
-      const ddd = phone.slice(2, 4);
-      const number = phone.slice(4);
+    if (cleanPhone.startsWith("55") && cleanPhone.length >= 12) {
+      const ddd = cleanPhone.slice(2, 4);
+      const number = cleanPhone.slice(4);
 
       if (number.length === 9 && number.startsWith("9")) {
         jidCandidates.push(`55${ddd}${number.slice(1)}`);
@@ -400,15 +494,15 @@ app.post("/send-whatsapp", async (req, res) => {
     if (!resolvedJid) {
       return res.status(404).json({
         success: false,
-        error: `Number ${phone} not found on WhatsApp`,
+        error: `Number ${cleanPhone} not found on WhatsApp`,
       });
     }
 
     const sentMsg = await sock.sendMessage(resolvedJid, { text: message });
+    const recipientPhone = getPhoneFromJid(resolvedJid);
 
     console.log(`[Send] Message sent to ${resolvedJid}, ID: ${sentMsg.key.id}`);
 
-    const recipientPhone = getPhoneFromJid(resolvedJid);
     await sendWebhookStatus(recipientPhone, "SENT", sentMsg.key.id);
 
     res.json({
@@ -418,7 +512,10 @@ app.post("/send-whatsapp", async (req, res) => {
     });
   } catch (err) {
     console.error("[Send] Error:", err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
 

@@ -4,6 +4,8 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   makeCacheableSignalKeyStore,
+  fetchLatestBaileysVersion,
+  Browsers,
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const QRCode = require("qrcode");
@@ -13,6 +15,7 @@ const path = require("path");
 const app = express();
 app.use(express.json());
 
+// CORS middleware
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -45,7 +48,7 @@ let webhookUrl =
   null;
 
 if (webhookUrl) {
-  console.log("[Server] Webhook configurado em runtime: " + webhookUrl);
+  console.log(`[Server] Webhook configurado em runtime: ${webhookUrl}`);
 }
 
 const logger = pino({ level: "silent" });
@@ -80,10 +83,32 @@ async function startSock() {
   connectingInProgress = true;
 
   try {
+    // Delete stale auth on fresh start to avoid 515/405 loops
+    if (blocked405 || retryCount >= MAX_RETRIES) {
+      console.log("[WhatsApp] Clearing auth_info due to previous block...");
+      if (fs.existsSync(AUTH_DIR)) {
+        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      }
+      blocked405 = false;
+      retryCount = 0;
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
-    console.log("[WhatsApp] Iniciando conexao...");
-    console.log("[Server] Webhook URL: " + webhookUrl);
+    // ===== FIX FOR 405: fetch latest WA Web version =====
+    let waVersion;
+    try {
+      const versionResult = await fetchLatestBaileysVersion();
+      waVersion = versionResult.version;
+      console.log(`[WhatsApp] Fetched WA version: ${JSON.stringify(waVersion)}`);
+    } catch (vErr) {
+      // Fallback to a known working version if fetch fails
+      waVersion = [2, 3000, 1015901307];
+      console.log(`[WhatsApp] Version fetch failed, using fallback: ${JSON.stringify(waVersion)}`);
+    }
+
+    console.log("[WhatsApp] Iniciando conexão...");
+    console.log(`[Server] Webhook URL: ${webhookUrl}`);
 
     sock = makeWASocket({
       logger,
@@ -92,11 +117,16 @@ async function startSock() {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
+      // ===== FIX FOR 405: set browser identity and version =====
+      browser: Browsers.ubuntu("Chrome"),
+      version: waVersion,
       retryRequestDelayMs: 250,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: undefined,
+      keepAliveIntervalMs: 25000,
     });
 
-    const version = sock.version || "unknown";
-    console.log("[WhatsApp] Using Baileys version: " + version);
+    console.log(`[WhatsApp] Using WA version: ${JSON.stringify(waVersion)}`);
 
     sock.ev.on("creds.update", saveCreds);
 
@@ -126,31 +156,49 @@ async function startSock() {
         connectingInProgress = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errorMessage = lastDisconnect?.error?.message || "";
-        lastError = "Status: " + statusCode + ". " + errorMessage;
+        lastError = `Status: ${statusCode}. ${errorMessage}`;
 
-        console.log("[WhatsApp] Connection closed. Status: " + statusCode + ". Message: " + errorMessage);
+        console.log(
+          `[WhatsApp] Connection closed. Status: ${statusCode}. Message: ${errorMessage}`
+        );
 
+        // 515 = Stream Errored — do NOT auto-reconnect
         if (statusCode === 515) {
-          console.log("[WhatsApp] Status 515 detected - NOT auto-reconnecting. Call /clear-auth then /reset-json.");
+          console.log("[WhatsApp] Status 515 detected - NOT auto-reconnecting.");
           qrCodeData = null;
           qrRawString = null;
           return;
         }
 
+        // 405 = rate limited / version mismatch
         if (statusCode === 405) {
           retryCount++;
+          console.log(`[WhatsApp] 405 error. Retry count: ${retryCount}/${MAX_RETRIES}`);
+          
           if (retryCount >= MAX_RETRIES) {
             blocked405 = true;
-            console.log("[WhatsApp] Blocked after too many 405 errors. Waiting for cooldown.");
+            console.log("[WhatsApp] Blocked after too many 405 errors. Clearing auth and waiting for cooldown.");
+            // Clear auth to start fresh next time
+            if (fs.existsSync(AUTH_DIR)) {
+              fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+            }
+            qrCodeData = null;
+            qrRawString = null;
             return;
+          }
+          
+          // On 405, clear auth and retry with delay
+          console.log("[WhatsApp] Clearing auth_info after 405 before retry...");
+          if (fs.existsSync(AUTH_DIR)) {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
           }
         }
 
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
         if (shouldReconnect) {
-          const delay = Math.min(3000 * Math.pow(2, retryCount), 30000);
-          console.log("[WhatsApp] Reconnecting in " + delay + "ms...");
+          const delay = Math.min(5000 * Math.pow(2, retryCount), 60000);
+          console.log(`[WhatsApp] Reconnecting in ${delay}ms...`);
           setTimeout(startSock, delay);
         } else {
           console.log("[WhatsApp] Logged out. Clearing auth...");
@@ -188,7 +236,7 @@ async function startSock() {
 
         if (!text || !from) continue;
 
-        console.log("[WhatsApp] Message from " + from + ": " + text.substring(0, 100));
+        console.log(`[WhatsApp] Message from ${from}: ${text.substring(0, 100)}`);
         lastIncomingMessage = { from, text: text.substring(0, 200), at: new Date().toISOString() };
 
         if (webhookUrl) {
@@ -205,7 +253,7 @@ async function startSock() {
             });
             const data = await resp.text();
             lastWebhookResult = { status: resp.status, body: data.substring(0, 500), at: new Date().toISOString() };
-            console.log("[WhatsApp] Webhook response: " + resp.status);
+            console.log(`[WhatsApp] Webhook response: ${resp.status}`);
           } catch (err) {
             lastWebhookResult = { error: err.message, at: new Date().toISOString() };
             console.error("[WhatsApp] Webhook error:", err.message);
@@ -220,8 +268,10 @@ async function startSock() {
   }
 }
 
-function buildHealthResponse() {
-  return {
+// ==================== ROUTES ====================
+
+app.get("/health", (req, res) => {
+  res.json({
     connected: isConnected,
     status: isConnected ? "connected" : blocked405 ? "blocked" : "disconnected",
     phone: connectedPhone,
@@ -234,11 +284,25 @@ function buildHealthResponse() {
     lastWebhookResult,
     qrAvailable: !!qrCodeData,
     lastConnectionUpdate,
-  };
-}
+  });
+});
 
-app.get("/health", (req, res) => res.json(buildHealthResponse()));
-app.get("/health-json", (req, res) => res.json(buildHealthResponse()));
+app.get("/health-json", (req, res) => {
+  res.json({
+    connected: isConnected,
+    status: isConnected ? "connected" : blocked405 ? "blocked" : "disconnected",
+    phone: connectedPhone,
+    webhookConfigured: !!webhookUrl,
+    webhookUrl: webhookUrl,
+    blocked405,
+    retryCount,
+    lastError,
+    lastIncomingMessage,
+    lastWebhookResult,
+    qrAvailable: !!qrCodeData,
+    lastConnectionUpdate,
+  });
+});
 
 app.get("/", (req, res) => {
   res.json({
@@ -250,18 +314,24 @@ app.get("/", (req, res) => {
 });
 
 app.get("/qr-json", (req, res) => {
-  if (isConnected) return res.json({ connected: true, phone: connectedPhone, qr: null });
-  if (qrCodeData) return res.json({ connected: false, qr: qrCodeData });
+  if (isConnected) {
+    return res.json({ connected: true, phone: connectedPhone, qr: null });
+  }
+  if (qrCodeData) {
+    return res.json({ connected: false, qr: qrCodeData });
+  }
   res.json({ connected: false, qr: null, message: "Aguardando QR Code..." });
 });
 
 app.get("/qr", (req, res) => {
-  if (isConnected) return res.send("<h1>WhatsApp Connected!</h1><p>Phone: " + connectedPhone + "</p>");
+  if (isConnected) {
+    return res.send("<h1>WhatsApp Connected!</h1><p>Phone: " + connectedPhone + "</p>");
+  }
   if (qrCodeData) {
     return res.send(
       '<html><body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#111">' +
-      '<img src="' + qrCodeData + '" style="width:400px;height:400px" />' +
-      "</body></html>"
+        '<img src="' + qrCodeData + '" style="width:400px;height:400px" />' +
+        "</body></html>"
     );
   }
   res.send("<h1>Aguardando QR Code...</h1><p>Acesse /reset-json para iniciar</p>");
@@ -283,19 +353,17 @@ app.post("/set-webhook", (req, res) => {
   const { webhookUrl: url } = req.body;
   if (!url) return res.status(400).json({ error: "webhookUrl is required" });
   webhookUrl = url;
-  console.log("[Server] Webhook configurado: " + webhookUrl);
+  console.log(`[Server] Webhook configurado: ${webhookUrl}`);
   res.json({ success: true, webhookUrl });
 });
 
-// ==================== CLEAR AUTH (fixes 515) ====================
+// ==================== CLEAR AUTH ====================
 app.get("/clear-auth", (req, res) => {
-  console.log("[WhatsApp] /clear-auth called");
-
+  console.log("[WhatsApp] /clear-auth called — clearing auth_info...");
   if (sock) {
     try { sock.end(); } catch (e) {}
     sock = null;
   }
-
   isConnected = false;
   connectedPhone = null;
   qrCodeData = null;
@@ -314,10 +382,9 @@ app.get("/clear-auth", (req, res) => {
       return res.status(500).json({ success: false, error: err.message });
     }
   } else {
-    console.log("[WhatsApp] auth_info does not exist");
+    console.log("[WhatsApp] auth_info does not exist, nothing to clear");
   }
-
-  res.json({ success: true, message: "Auth cleared. Call /reset-json to start fresh." });
+  res.json({ success: true, message: "Auth cleared. Call /reset-json to start a fresh session." });
 });
 
 app.post("/clear-auth", (req, res) => {
@@ -328,12 +395,10 @@ app.post("/clear-auth", (req, res) => {
 // ==================== RESET / RECONNECT ====================
 app.get("/reset-json", async (req, res) => {
   console.log("[WhatsApp] /reset-json called");
-
   if (sock) {
     try { sock.end(); } catch (e) {}
     sock = null;
   }
-
   isConnected = false;
   connectedPhone = null;
   qrCodeData = null;
@@ -343,6 +408,7 @@ app.get("/reset-json", async (req, res) => {
   lastError = null;
   connectingInProgress = false;
 
+  // Delete auth for fresh QR
   if (fs.existsSync(AUTH_DIR)) {
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
   }
@@ -358,17 +424,14 @@ app.get("/reset", (req, res) => {
 
 app.get("/reconnect", async (req, res) => {
   console.log("[WhatsApp] /reconnect called");
-
   if (sock) {
     try { sock.end(); } catch (e) {}
     sock = null;
   }
-
   isConnected = false;
   connectingInProgress = false;
   blocked405 = false;
   retryCount = 0;
-
   startSock();
   res.json({ success: true, message: "Reconnecting..." });
 });
@@ -399,9 +462,9 @@ app.post("/send-whatsapp", async (req, res) => {
 
   try {
     const normalized = targetPhone.replace(/\D/g, "");
-    const jid = normalized.includes("@") ? normalized : normalized + "@s.whatsapp.net";
+    const jid = normalized.includes("@") ? normalized : `${normalized}@s.whatsapp.net`;
     await sock.sendMessage(jid, { text: targetMessage });
-    console.log("[WhatsApp] Message sent to " + jid);
+    console.log(`[WhatsApp] Message sent to ${jid}`);
     res.json({ success: true, to: jid });
   } catch (err) {
     console.error("[WhatsApp] Send error:", err.message);
@@ -416,6 +479,6 @@ app.post("/send", (req, res) => {
 
 // ==================== START ====================
 app.listen(PORT, () => {
-  console.log("[Server] Running on port " + PORT);
+  console.log(`[Server] Running on port ${PORT}`);
   console.log("[Server] Waiting for /reset-json to start WhatsApp connection...");
 });
